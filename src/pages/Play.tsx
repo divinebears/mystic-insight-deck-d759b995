@@ -1,14 +1,18 @@
 import { useAuth } from '@/contexts/AuthContext';
 import { useNavigate, useParams } from 'react-router-dom';
 import { CHAPTERS, type Interpretation, type SceneQuestion } from '@/data/chapters';
-import { DECK, CARD_BACK, getCardByName } from '@/data/deck';
+import { getCardByName } from '@/data/deck';
 import { Button } from '@/components/ui/button';
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { supabase } from '@/integrations/supabase/client';
 import { useAnalytics } from '@/hooks/useAnalytics';
 import { toast } from 'sonner';
+import CardSpread from '@/components/game/CardSpread';
+import ScoreRecord, { type AnswerRecord } from '@/components/game/ScoreRecord';
+import NotesJournal from '@/components/game/NotesJournal';
 
-type Phase = 'narrative' | 'shuffling' | 'revealed' | 'choose' | 'result' | 'final' | 'complete';
+// Phases: narrative → pick question → shuffling → revealed → choose answer → result → next scene
+type Phase = 'narrative' | 'pick-question' | 'shuffling' | 'revealed' | 'choose' | 'result' | 'final' | 'complete';
 
 export default function Play() {
   const { id } = useParams<{ id: string }>();
@@ -19,19 +23,17 @@ export default function Play() {
   const { track } = useAnalytics();
 
   const [sceneIndex, setSceneIndex] = useState(0);
-  const [questionIndex, setQuestionIndex] = useState(0);
-  const [score, setScore] = useState(0);
   const [phase, setPhase] = useState<Phase>('narrative');
+  const [selectedQuestion, setSelectedQuestion] = useState<SceneQuestion | null>(null);
   const [selectedAnswer, setSelectedAnswer] = useState<Interpretation | null>(null);
+  const [score, setScore] = useState(0);
   const [hintsLeft, setHintsLeft] = useState(3);
   const [hintVisible, setHintVisible] = useState(false);
-  const [notes, setNotes] = useState<string[]>([]);
-  const [noteInput, setNoteInput] = useState('');
-  const [showNotes, setShowNotes] = useState(false);
+  const [notes, setNotes] = useState<{ sceneIndex: number; sceneTitle: string; text: string }[]>([]);
+  const [answerRecords, setAnswerRecords] = useState<AnswerRecord[]>([]);
   const [finalAttempts, setFinalAttempts] = useState(0);
   const [lastAttemptDate, setLastAttemptDate] = useState<string | null>(null);
   const [progressId, setProgressId] = useState<string | null>(null);
-  const [usedCards, setUsedCards] = useState<number[]>([]);
   const saveTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -50,11 +52,12 @@ export default function Play() {
           setHintsLeft(data.hints_left);
           setFinalAttempts(data.final_attempts);
           setLastAttemptDate(data.last_attempt_date);
-          setNotes(Array.isArray(data.notes) ? (data.notes as string[]) : []);
-          setUsedCards(Array.isArray(data.used_cards) ? (data.used_cards as number[]) : []);
-          if (data.completed) {
-            setPhase('complete');
+          setNotes(Array.isArray(data.notes) ? (data.notes as any[]) : []);
+          const used = Array.isArray(data.used_cards) ? (data.used_cards as any[]) : [];
+          if (used.length > 0 && typeof used[0] === 'object' && 'question' in used[0]) {
+            setAnswerRecords(used as AnswerRecord[]);
           }
+          if (data.completed) setPhase('complete');
         }
       });
   }, [user, chapterId, chapter]);
@@ -71,7 +74,7 @@ export default function Play() {
       final_attempts: finalAttempts,
       last_attempt_date: lastAttemptDate,
       notes: notes as any,
-      used_cards: usedCards as any,
+      used_cards: answerRecords as any,
       ...overrides,
       updated_at: new Date().toISOString(),
     };
@@ -82,72 +85,81 @@ export default function Play() {
       const { data } = await supabase.from('game_progress').insert(payload).select('id').maybeSingle();
       if (data) setProgressId(data.id);
     }
-  }, [user, chapterId, sceneIndex, score, hintsLeft, finalAttempts, lastAttemptDate, notes, usedCards, progressId, chapter]);
+  }, [user, chapterId, sceneIndex, score, hintsLeft, finalAttempts, lastAttemptDate, notes, answerRecords, progressId, chapter]);
 
-  // Debounced auto-save on state changes
+  // Debounced auto-save
   useEffect(() => {
     if (!user || !chapter || phase === 'complete') return;
     if (saveTimeout.current) clearTimeout(saveTimeout.current);
     saveTimeout.current = setTimeout(() => saveProgress(), 2000);
     return () => { if (saveTimeout.current) clearTimeout(saveTimeout.current); };
-  }, [sceneIndex, score, hintsLeft, notes, usedCards, saveProgress, user, chapter, phase]);
+  }, [sceneIndex, score, hintsLeft, notes, answerRecords, saveProgress, user, chapter, phase]);
 
   if (loading || !user) return <div className="min-h-screen flex items-center justify-center"><p className="text-primary glow-text font-['Cinzel']">Loading...</p></div>;
   if (!chapter) return <div className="min-h-screen flex items-center justify-center"><p className="text-destructive font-['Cinzel']">Chapter not found</p><Button className="ml-4" onClick={() => navigate('/campaign')}>Back</Button></div>;
 
   const scene = chapter.scenes[sceneIndex];
-  const question: SceneQuestion | undefined = scene?.questions?.[questionIndex];
   const totalScenes = chapter.scenes.length;
+  const questionCards = selectedQuestion ? selectedQuestion.cardNames.map(name => getCardByName(name)).filter(Boolean) : [];
 
-  // Get cards for current question — always same cards per question
-  const questionCards = question ? question.cardNames.map(name => getCardByName(name)).filter(Boolean) : [];
-
-  // Shuffle animation
-  const startShuffle = () => {
+  // Pick one of 3 questions for this scene
+  const handlePickQuestion = (q: SceneQuestion) => {
+    setSelectedQuestion(q);
+    setHintVisible(false);
     setPhase('shuffling');
-    setTimeout(() => setPhase('revealed'), 1800);
+    // Auto-reveal after shuffle animation
+    setTimeout(() => setPhase('revealed'), 2000);
+  };
+
+  // After revealed, go directly to choose
+  const proceedToChoose = () => {
+    setPhase('choose');
   };
 
   // Choose interpretation
   const handleChoice = (interp: Interpretation) => {
     setSelectedAnswer(interp);
     setScore(prev => prev + interp.points);
+    const record: AnswerRecord = {
+      sceneIndex,
+      sceneTitle: scene?.title || '',
+      question: selectedQuestion?.question || '',
+      cardNames: selectedQuestion?.cardNames || [],
+      chosenAnswer: interp.text,
+      quality: interp.quality,
+      points: interp.points,
+    };
+    setAnswerRecords(prev => [...prev, record]);
     setPhase('result');
-    track('answer_chosen', { chapter: chapterId, scene: sceneIndex, question: questionIndex, quality: interp.quality, points: interp.points });
+    track('answer_chosen', { chapter: chapterId, scene: sceneIndex, quality: interp.quality, points: interp.points });
   };
 
-  // Use hint
+  // Use hint — reveals all card meanings for current question
   const useHint = () => {
     if (hintsLeft <= 0) return;
     setHintsLeft(prev => prev - 1);
     setHintVisible(true);
-    track('hint_used', { chapter: chapterId, scene: sceneIndex, question: questionIndex, hintsRemaining: hintsLeft - 1 });
+    track('hint_used', { chapter: chapterId, scene: sceneIndex, hintsRemaining: hintsLeft - 1 });
   };
 
-  // Next question or next scene
+  // Next scene
   const handleNext = () => {
     setSelectedAnswer(null);
+    setSelectedQuestion(null);
     setHintVisible(false);
 
-    if (question && questionIndex < scene.questions.length - 1) {
-      setQuestionIndex(prev => prev + 1);
-      setPhase('narrative');
-    } else if (sceneIndex < totalScenes - 1) {
+    if (sceneIndex < totalScenes - 1) {
       const nextScene = sceneIndex + 1;
       setSceneIndex(nextScene);
-      setQuestionIndex(0);
       setPhase('narrative');
 
-      // Check if next scene is final
       if (chapter.scenes[nextScene]?.isFinal) {
         const today = new Date().toISOString().slice(0, 10);
         if (lastAttemptDate === today && finalAttempts >= 3) {
           toast.error('You have used all 3 attempts today for the final scene. Come back tomorrow!');
-          setPhase('narrative');
         }
       }
     } else {
-      // Chapter complete
       setPhase('complete');
       saveProgress({ completed: true, earned_badges: [chapter.badge] as any });
       track('chapter_completed', { chapter: chapterId, score });
@@ -170,21 +182,11 @@ export default function Play() {
       toast.error(option.ending);
       if (newAttempts >= 3) {
         toast.error('No more attempts today. Come back tomorrow!');
-        saveProgress({ final_attempts: newAttempts, last_attempt_date: today });
       } else {
         toast.info(`${3 - newAttempts} attempt(s) remaining today.`);
-        saveProgress({ final_attempts: newAttempts, last_attempt_date: today });
       }
+      saveProgress({ final_attempts: newAttempts, last_attempt_date: today });
     }
-  };
-
-  // Add note
-  const addNote = () => {
-    if (!noteInput.trim()) return;
-    const newNotes = [...notes, noteInput.trim()];
-    setNotes(newNotes);
-    setNoteInput('');
-    track('note_added', { chapter: chapterId, scene: sceneIndex });
   };
 
   const bgStyle = scene?.backgroundImage ? { backgroundImage: `url(${scene.backgroundImage})` } : {};
@@ -210,11 +212,12 @@ export default function Play() {
             <p className="text-2xl text-primary font-['Cinzel']">{chapter.badgeEmoji} Chapter Complete!</p>
             <p className="text-foreground">Final Score: {score}</p>
             <p className="text-primary">Badge Earned: {chapter.badge}</p>
+            <ScoreRecord records={answerRecords} totalScore={score} />
             <Button onClick={() => navigate('/campaign')}>Return to Campaign</Button>
           </div>
         )}
 
-        {/* Phase: Narrative */}
+        {/* Phase: Narrative — show story intro then 3 question choices */}
         {phase === 'narrative' && scene && (
           <div className="space-y-4 fade-in">
             <div className="p-4 rounded-lg border border-border/50 bg-card/60">
@@ -241,68 +244,72 @@ export default function Play() {
                 })()}
               </div>
             ) : (
-              <Button onClick={startShuffle} className="w-full font-['Cinzel']">
-                Consult the Cards
+              <div className="space-y-2">
+                <p className="text-primary font-['Cinzel'] text-sm text-center">Choose a clue to investigate:</p>
+                {scene.questions.map((q, i) => (
+                  <button
+                    key={i}
+                    onClick={() => handlePickQuestion(q)}
+                    className="w-full text-left p-3 rounded-lg border border-border/50 bg-card/40 hover:border-primary/60 transition-all text-foreground text-sm"
+                  >
+                    🔍 {q.question}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Phase: Shuffling — auto-shuffle animation */}
+        {phase === 'shuffling' && selectedQuestion && (
+          <div className="space-y-4">
+            <p className="text-center text-muted-foreground italic text-sm">The cards are being consulted...</p>
+            <CardSpread cards={questionCards.map(c => c!)} phase="shuffling" showMeanings={false} />
+          </div>
+        )}
+
+        {/* Phase: Revealed — cards shown, meanings hidden unless hint used, proceed to answers */}
+        {phase === 'revealed' && selectedQuestion && (
+          <div className="space-y-4 fade-in">
+            <CardSpread
+              cards={questionCards.map(c => c!)}
+              phase="revealed"
+              showMeanings={hintVisible}
+              cardMeanings={selectedQuestion.cardMeanings}
+            />
+            <div className="p-3 rounded-lg border border-primary/30 bg-card/60 text-center">
+              <p className="text-primary font-['Cinzel'] text-sm">{selectedQuestion.question}</p>
+            </div>
+            {/* Hint button */}
+            {!hintVisible && hintsLeft > 0 && (
+              <Button variant="ghost" size="sm" className="w-full text-muted-foreground" onClick={useHint}>
+                💡 Use Hint to Reveal Card Meanings ({hintsLeft} left)
               </Button>
             )}
+            <Button onClick={proceedToChoose} className="w-full font-['Cinzel']">
+              Choose Your Interpretation
+            </Button>
           </div>
         )}
 
-        {/* Phase: Shuffling */}
-        {phase === 'shuffling' && (
-          <div className="flex justify-center items-center gap-4 py-12">
-            {questionCards.map((card, i) => (
-              <div key={card!.id} className={`w-24 h-36 md:w-28 md:h-40 card-shadow rounded-lg overflow-hidden ${i % 2 === 0 ? 'shuffle-left' : 'shuffle-right'}`}>
-                <img src={CARD_BACK} alt="Card back" className="w-full h-full object-cover" />
-              </div>
-            ))}
-          </div>
-        )}
-
-        {/* Phase: Revealed */}
-        {phase === 'revealed' && question && (
-          <div className="space-y-4 fade-in">
-            <div className="flex justify-center gap-4">
-              {questionCards.map((card, i) => (
-                <div key={card!.id} className="card-container flipped w-24 h-36 md:w-28 md:h-40">
-                  <div className="card-inner">
-                    <div className="card-face card-back"><img src={CARD_BACK} alt="Back" /></div>
-                    <div className="card-face card-front"><img src={card!.image} alt={card!.name} /></div>
-                  </div>
-                </div>
-              ))}
-            </div>
-            <div className="text-center">
-              <p className="text-sm text-muted-foreground">
-                {questionCards.map((c, i) => `${c!.name} (${question.cardMeanings[i]})`).join(' · ')}
-              </p>
-            </div>
-            <div className="p-3 rounded-lg border border-primary/30 bg-card/60 text-center">
-              <p className="text-primary font-['Cinzel'] text-sm">{question.question}</p>
-            </div>
-            <Button onClick={() => setPhase('choose')} className="w-full font-['Cinzel']">Choose Your Interpretation</Button>
-          </div>
-        )}
-
-        {/* Phase: Choose */}
-        {phase === 'choose' && question && (
+        {/* Phase: Choose — pick from 3 interpretations */}
+        {phase === 'choose' && selectedQuestion && (
           <div className="space-y-3 fade-in">
-            <div className="flex justify-center gap-3 mb-2">
-              {questionCards.map((card) => (
-                <div key={card!.id} className="w-16 h-24 rounded overflow-hidden card-shadow">
-                  <img src={card!.image} alt={card!.name} className="w-full h-full object-cover" />
-                </div>
-              ))}
-            </div>
-            <p className="text-primary font-['Cinzel'] text-sm text-center">{question.question}</p>
+            <CardSpread
+              cards={questionCards.map(c => c!)}
+              phase="revealed"
+              showMeanings={hintVisible}
+              cardMeanings={selectedQuestion.cardMeanings}
+            />
+            <p className="text-primary font-['Cinzel'] text-sm text-center">{selectedQuestion.question}</p>
 
-            {hintVisible && (
-              <div className="p-2 rounded border border-primary/20 bg-card/40 text-xs text-muted-foreground text-center fade-in">
-                💡 Look for the interpretation that connects all card meanings together.
-              </div>
+            {!hintVisible && hintsLeft > 0 && (
+              <Button variant="ghost" size="sm" className="w-full text-muted-foreground" onClick={useHint}>
+                💡 Use Hint ({hintsLeft} left)
+              </Button>
             )}
 
-            {question.interpretations.map((interp, i) => (
+            {selectedQuestion.interpretations.map((interp, i) => (
               <button
                 key={i}
                 onClick={() => handleChoice(interp)}
@@ -311,12 +318,6 @@ export default function Play() {
                 {interp.text}
               </button>
             ))}
-
-            {hintsLeft > 0 && !hintVisible && (
-              <Button variant="ghost" size="sm" className="w-full text-muted-foreground" onClick={useHint}>
-                💡 Use Hint ({hintsLeft} left)
-              </Button>
-            )}
           </div>
         )}
 
@@ -336,32 +337,24 @@ export default function Play() {
               {selectedAnswer.explanation && <p className="text-xs text-muted-foreground mt-1 italic">{selectedAnswer.explanation}</p>}
             </div>
             <Button onClick={handleNext} className="w-full font-['Cinzel']">
-              {questionIndex < (scene?.questions?.length || 1) - 1 ? 'Next Clue' : sceneIndex < totalScenes - 1 ? 'Next Scene' : 'Finish Chapter'}
+              {sceneIndex < totalScenes - 1 ? 'Next Scene' : 'Finish Chapter'}
             </Button>
           </div>
         )}
 
-        {/* Notes Journal */}
+        {/* Score Record & Notes */}
         {phase !== 'complete' && (
-          <div className="mt-6">
-            <Button variant="ghost" size="sm" className="text-muted-foreground text-xs" onClick={() => setShowNotes(!showNotes)}>
-              📓 Notes ({notes.length})
-            </Button>
-            {showNotes && (
-              <div className="mt-2 p-3 rounded-lg border border-border/50 bg-card/40 space-y-2 fade-in">
-                {notes.map((n, i) => <p key={i} className="text-xs text-foreground">• {n}</p>)}
-                <div className="flex gap-2">
-                  <input
-                    value={noteInput}
-                    onChange={e => setNoteInput(e.target.value)}
-                    onKeyDown={e => e.key === 'Enter' && addNote()}
-                    placeholder="Add a note..."
-                    className="flex-1 bg-background/50 border border-border rounded px-2 py-1 text-xs text-foreground"
-                  />
-                  <Button size="sm" variant="outline" onClick={addNote}>Add</Button>
-                </div>
-              </div>
-            )}
+          <div className="space-y-2">
+            <ScoreRecord records={answerRecords} totalScore={score} />
+            <NotesJournal
+              notes={notes}
+              currentSceneTitle={scene?.title || ''}
+              currentSceneIndex={sceneIndex}
+              onAddNote={(note) => {
+                setNotes(prev => [...prev, note]);
+                track('note_added', { chapter: chapterId, scene: sceneIndex });
+              }}
+            />
           </div>
         )}
       </div>
