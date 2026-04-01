@@ -1,21 +1,39 @@
 import { useAuth } from '@/contexts/AuthContext';
 import { useNavigate } from 'react-router-dom';
-import { DECK, CARD_BACK, drawCards, type LenormandCard } from '@/data/deck';
+import { DECK, drawCards, type LenormandCard } from '@/data/deck';
 import { Button } from '@/components/ui/button';
 import { useState } from 'react';
 import { useAnalytics } from '@/hooks/useAnalytics';
+import CardSpread from '@/components/game/CardSpread';
 
 type SpreadType = '3-line' | '5-line' | '9-box';
-type Phase = 'select' | 'shuffling' | 'revealed' | 'interpret';
+type Phase = 'select' | 'shuffling' | 'revealed' | 'interpret' | 'result';
 
-// Generate 3 meanings for a card: 1 correct, 2 wrong
-function generateMeanings(card: LenormandCard, allCards: LenormandCard[]): { text: string; isCorrect: boolean }[] {
-  const correct = { text: `${card.name}: ${card.keywords.join(', ')} — ${card.narrative}`, isCorrect: true };
-  const others = allCards.filter(c => c.id !== card.id);
+// Generate a whole-spread interpretation question
+function generateSpreadInterpretation(cards: LenormandCard[], allCards: LenormandCard[]) {
+  const cardNames = cards.map(c => c.name);
+  const keywords = cards.map(c => c.keywords[0]);
+  const narratives = cards.map(c => c.narrative);
+
+  const correctText = `The combination of ${cardNames.join(', ')} suggests: ${narratives.join(' ')} Together they indicate ${keywords.join(', ')}.`;
+
+  // Wrong interpretations — pick random other cards
+  const others = allCards.filter(c => !cards.find(cc => cc.id === c.id));
   const shuffled = [...others].sort(() => Math.random() - 0.5);
-  const wrong1 = { text: `${card.name}: ${shuffled[0].keywords.join(', ')} — ${shuffled[0].narrative}`, isCorrect: false };
-  const wrong2 = { text: `${card.name}: ${shuffled[1].keywords.join(', ')} — ${shuffled[1].narrative}`, isCorrect: false };
-  return [correct, wrong1, wrong2].sort(() => Math.random() - 0.5);
+  const wrong1Cards = shuffled.slice(0, cards.length);
+  const wrong1Text = `This spread reveals: ${wrong1Cards.map(c => c.narrative).join(' ')} The theme is ${wrong1Cards.map(c => c.keywords[0]).join(', ')}.`;
+  const wrong2Cards = shuffled.slice(cards.length, cards.length * 2);
+  const wrong2Text = `The cards indicate: ${wrong2Cards.map(c => c.narrative).join(' ')} The message centers on ${wrong2Cards.map(c => c.keywords[0]).join(', ')}.`;
+
+  const question = `What is the combined meaning of this ${cardNames.length}-card spread?`;
+
+  const options = [
+    { text: correctText, isCorrect: true },
+    { text: wrong1Text, isCorrect: false },
+    { text: wrong2Text, isCorrect: false },
+  ].sort(() => Math.random() - 0.5);
+
+  return { question, options };
 }
 
 export default function ReaderMode() {
@@ -26,53 +44,60 @@ export default function ReaderMode() {
   const [spreadType, setSpreadType] = useState<SpreadType | null>(null);
   const [phase, setPhase] = useState<Phase>('select');
   const [cards, setCards] = useState<LenormandCard[]>([]);
-  const [activeCardIndex, setActiveCardIndex] = useState<number | null>(null);
-  const [meanings, setMeanings] = useState<{ text: string; isCorrect: boolean }[]>([]);
-  const [chosen, setChosen] = useState<{ [idx: number]: boolean | null }>({});
+  const [interpretation, setInterpretation] = useState<{ question: string; options: { text: string; isCorrect: boolean }[] } | null>(null);
+  const [chosenResult, setChosenResult] = useState<boolean | null>(null);
+  const [hintsLeft, setHintsLeft] = useState(3);
+  const [hintVisible, setHintVisible] = useState(false);
 
   const startSpread = (type: SpreadType) => {
     const count = type === '3-line' ? 3 : type === '5-line' ? 5 : 9;
     setSpreadType(type);
     setPhase('shuffling');
-    setChosen({});
-    setActiveCardIndex(null);
+    setChosenResult(null);
+    setHintVisible(false);
     const drawn = drawCards(count);
     setCards(drawn);
+    const interp = generateSpreadInterpretation(drawn, DECK);
+    setInterpretation(interp);
     track('reader_spread', { type, cardCount: count });
-    setTimeout(() => setPhase('revealed'), 1800);
+    setTimeout(() => setPhase('revealed'), 2000);
   };
 
-  const interpretCard = (idx: number) => {
-    if (chosen[idx] !== undefined) return;
-    setActiveCardIndex(idx);
-    setMeanings(generateMeanings(cards[idx], DECK));
-    setPhase('interpret');
+  const useHint = () => {
+    if (hintsLeft <= 0) return;
+    setHintsLeft(prev => prev - 1);
+    setHintVisible(true);
   };
 
-  const chooseMeaning = (isCorrect: boolean) => {
-    if (activeCardIndex === null) return;
-    setChosen(prev => ({ ...prev, [activeCardIndex]: isCorrect }));
-    setActiveCardIndex(null);
-    setPhase('revealed');
+  const chooseInterpretation = (isCorrect: boolean) => {
+    setChosenResult(isCorrect);
+    setPhase('result');
   };
 
   const resetSpread = () => {
     setPhase('select');
     setSpreadType(null);
     setCards([]);
-    setChosen({});
-    setActiveCardIndex(null);
+    setInterpretation(null);
+    setChosenResult(null);
+    setHintVisible(false);
   };
 
   if (loading) return <div className="min-h-screen flex items-center justify-center"><p className="text-primary glow-text font-['Cinzel']">Loading...</p></div>;
   if (!user) { navigate('/auth'); return null; }
+
+  const cardMeanings = cards.map(c => `${c.keywords.join(', ')}`);
+  const layout = spreadType === '9-box' ? 'box' : 'line';
 
   return (
     <div className="min-h-screen p-4 md:p-8" style={{ background: 'linear-gradient(180deg, hsl(260,35%,12%), hsl(240,20%,6%))' }}>
       <div className="max-w-3xl mx-auto">
         <div className="flex items-center justify-between mb-6">
           <h1 className="text-2xl text-primary glow-text font-['Cinzel']">Reader Mode</h1>
-          <Button variant="outline" size="sm" onClick={() => navigate('/menu')}>← Menu</Button>
+          <div className="flex items-center gap-3">
+            {phase !== 'select' && <span className="text-xs text-muted-foreground">Hints: {hintsLeft}</span>}
+            <Button variant="outline" size="sm" onClick={() => navigate('/menu')}>← Menu</Button>
+          </div>
         </div>
 
         {/* Select Spread */}
@@ -107,94 +132,66 @@ export default function ReaderMode() {
 
         {/* Shuffling */}
         {phase === 'shuffling' && (
-          <div className="flex justify-center items-center gap-3 py-16 flex-wrap">
-            {cards.map((card, i) => (
-              <div key={card.id} className={`w-20 h-28 md:w-24 md:h-34 card-shadow rounded-lg overflow-hidden ${i % 2 === 0 ? 'shuffle-left' : 'shuffle-right'}`}>
-                <img src={CARD_BACK} alt="Card back" className="w-full h-full object-cover" />
-              </div>
-            ))}
+          <div className="space-y-4">
+            <p className="text-center text-muted-foreground italic text-sm">The cards are being drawn...</p>
+            <CardSpread cards={cards} phase="shuffling" showMeanings={false} layout={layout as any} />
           </div>
         )}
 
-        {/* Revealed */}
-        {(phase === 'revealed' || phase === 'interpret') && (
+        {/* Revealed + Interpret */}
+        {(phase === 'revealed' || phase === 'interpret') && interpretation && (
           <div className="space-y-6 fade-in">
-            {/* Cards Layout */}
-            {spreadType === '9-box' ? (
-              // 3x3 Grid
-              <div className="grid grid-cols-3 gap-3 max-w-md mx-auto">
-                {cards.map((card, i) => (
-                  <button
-                    key={card.id}
-                    onClick={() => interpretCard(i)}
-                    className={`card-container flipped ${chosen[i] !== undefined ? 'opacity-60' : 'hover:scale-105'} transition-all`}
-                    disabled={chosen[i] !== undefined}
-                  >
-                    <div className="w-full aspect-[2/3] relative">
-                      <img src={card.image} alt={card.name} className="w-full h-full object-cover rounded-lg card-shadow" />
-                      <p className="text-xs text-primary font-['Cinzel'] text-center mt-1">{card.name}</p>
-                      {chosen[i] !== undefined && (
-                        <div className={`absolute inset-0 flex items-center justify-center rounded-lg ${chosen[i] ? 'bg-green-900/50' : 'bg-red-900/50'}`}>
-                          <span className="text-2xl">{chosen[i] ? '✓' : '✗'}</span>
-                        </div>
-                      )}
-                    </div>
-                  </button>
-                ))}
-              </div>
-            ) : (
-              // Horizontal Line
-              <div className="flex justify-center gap-3 flex-wrap">
-                {cards.map((card, i) => (
-                  <button
-                    key={card.id}
-                    onClick={() => interpretCard(i)}
-                    className={`${chosen[i] !== undefined ? 'opacity-60' : 'hover:scale-105'} transition-all`}
-                    disabled={chosen[i] !== undefined}
-                  >
-                    <div className="w-24 h-36 md:w-28 md:h-40 relative">
-                      <img src={card.image} alt={card.name} className="w-full h-full object-cover rounded-lg card-shadow" />
-                      {chosen[i] !== undefined && (
-                        <div className={`absolute inset-0 flex items-center justify-center rounded-lg ${chosen[i] ? 'bg-green-900/50' : 'bg-red-900/50'}`}>
-                          <span className="text-2xl">{chosen[i] ? '✓' : '✗'}</span>
-                        </div>
-                      )}
-                    </div>
-                    <p className="text-xs text-primary font-['Cinzel'] text-center mt-1">{card.name}</p>
-                  </button>
-                ))}
-              </div>
+            <CardSpread
+              cards={cards}
+              phase="revealed"
+              showMeanings={hintVisible}
+              cardMeanings={cardMeanings}
+              layout={layout as any}
+            />
+
+            {/* Hint button */}
+            {!hintVisible && hintsLeft > 0 && (
+              <Button variant="ghost" size="sm" className="w-full text-muted-foreground" onClick={useHint}>
+                💡 Use Hint to Reveal All Card Meanings ({hintsLeft} left)
+              </Button>
             )}
 
-            {/* Interpretation panel */}
-            {phase === 'interpret' && activeCardIndex !== null && (
-              <div className="p-4 rounded-lg border border-primary/30 bg-card/60 space-y-3 fade-in">
-                <p className="text-primary font-['Cinzel'] text-center">What does {cards[activeCardIndex].name} mean?</p>
-                {meanings.map((m, i) => (
-                  <button
-                    key={i}
-                    onClick={() => chooseMeaning(m.isCorrect)}
-                    className="w-full text-left p-3 rounded-lg border border-border/50 bg-card/40 hover:border-primary/60 transition-all text-foreground text-sm"
-                  >
-                    {m.text}
-                  </button>
-                ))}
-              </div>
-            )}
+            {/* Question + 3 interpretations */}
+            <div className="p-4 rounded-lg border border-primary/30 bg-card/60 space-y-3">
+              <p className="text-primary font-['Cinzel'] text-center">{interpretation.question}</p>
+              {interpretation.options.map((opt, i) => (
+                <button
+                  key={i}
+                  onClick={() => chooseInterpretation(opt.isCorrect)}
+                  className="w-full text-left p-3 rounded-lg border border-border/50 bg-card/40 hover:border-primary/60 transition-all text-foreground text-sm"
+                >
+                  {opt.text}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
 
-            {/* All cards interpreted */}
-            {Object.keys(chosen).length === cards.length && phase === 'revealed' && (
-              <div className="text-center space-y-3 fade-in">
-                <p className="text-primary font-['Cinzel']">Spread Complete!</p>
-                <p className="text-muted-foreground text-sm">
-                  {Object.values(chosen).filter(v => v).length}/{cards.length} correct interpretations
-                </p>
-                <div className="flex justify-center gap-3">
-                  <Button onClick={resetSpread}>New Spread</Button>
-                  <Button variant="outline" onClick={() => navigate('/menu')}>Back to Menu</Button>
-                </div>
-              </div>
-            )}
+        {/* Result */}
+        {phase === 'result' && (
+          <div className="space-y-4 fade-in text-center">
+            <CardSpread
+              cards={cards}
+              phase="revealed"
+              showMeanings={true}
+              cardMeanings={cardMeanings}
+              layout={layout as any}
+            />
+            <div className={`p-4 rounded-lg border ${chosenResult ? 'border-green-500/50 bg-green-950/30' : 'border-red-500/50 bg-red-950/30'}`}>
+              <p className="font-['Cinzel'] text-lg">{chosenResult ? '✨ Correct Interpretation!' : '❌ Incorrect'}</p>
+              <p className="text-sm text-muted-foreground mt-2">
+                The cards were: {cards.map(c => `${c.name} (${c.keywords.join(', ')})`).join(' · ')}
+              </p>
+            </div>
+            <div className="flex justify-center gap-3">
+              <Button onClick={resetSpread}>New Spread</Button>
+              <Button variant="outline" onClick={() => navigate('/menu')}>Back to Menu</Button>
+            </div>
           </div>
         )}
       </div>
